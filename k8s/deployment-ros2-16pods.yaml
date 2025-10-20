@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: timing-experiment
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: timing-pod-ros2-16
+  namespace: timing-experiment
+spec:
+  serviceName: "timing-service"
+  replicas: 16
+  selector:
+    matchLabels:
+      app: timing-experiment
+      image-type: ros2
+      pod-count: "16"
+  template:
+    metadata:
+      labels:
+        app: timing-experiment
+        image-type: ros2
+        pod-count: "16"
+      annotations:
+        core-id: "8-15"
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: timing-container
+        image: timing-experiment:ros2
+        imagePullPolicy: Never
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /shared
+      volumes:
+      - name: shared-storage
+        hostPath:
+          path: /mnt/experiment-data/ros2-16pods
+          type: DirectoryOrCreate

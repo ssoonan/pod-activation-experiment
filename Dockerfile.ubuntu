@@ -1,0 +1,18 @@
+FROM ubuntu:22.04
+
+# Install build tools
+RUN apt-get update && \
+    apt-get install -y g++ make && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy application source
+COPY timing_app.cpp /app/timing_app.cpp
+
+# Build the application
+WORKDIR /app
+RUN g++ -o timing_app timing_app.cpp -lrt && \
+    chmod +x timing_app
+
+# Run the application
+CMD ["/app/timing_app"]
