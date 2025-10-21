@@ -5,7 +5,11 @@
 # 1. Deploying pods that log their start time
 # 2. Collecting the timing logs
 # 3. Restarting K3s (k3s-killall.sh + systemctl start k3s)
-# 4. Repeating for 20 iterations
+# 4. Repeating for 21 iterations (exp0 is warmup, exp1-exp20 are logged)
+#
+# Usage:
+#   ./run_experiment.sh         # Run experiments without building images
+#   ./run_experiment.sh --build # Build and import images before experiments
 
 set -e
 
@@ -17,11 +21,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-MAX_EXPERIMENTS=20
+MAX_EXPERIMENTS=21  # exp0 is warmup, exp1-exp20 are logged (20 experiments total)
 RESULTS_DIR="./experiment-results"
 POD_READY_WAIT=30  # seconds to wait for pods to be ready
 LOG_COLLECTION_WAIT=10  # seconds to wait for logs to be written
-K3S_RESTART_WAIT=60  # seconds to wait for K3s to restart
+K3S_STATUS_CHECK_INTERVAL=0.1  # seconds between K3s status checks
 
 # Print colored message
 print_msg() {
@@ -128,8 +132,10 @@ collect_logs() {
     fi
 }
 
-# Restart K3s
+# Restart K3s and track activation timestamp
 restart_k3s() {
+    local timestamp_file=$1
+
     print_header "Restarting K3s"
 
     print_msg "$YELLOW" "Stopping K3s..."
@@ -137,18 +143,42 @@ restart_k3s() {
     sleep 5
 
     print_msg "$YELLOW" "Starting K3s..."
+    local start_time=$(date +%s.%N)
     sudo systemctl start k3s
 
-    print_msg "$YELLOW" "Waiting for K3s to be ready (${K3S_RESTART_WAIT}s)..."
-    sleep $K3S_RESTART_WAIT
+    # Poll K3s status until it becomes active
+    print_msg "$YELLOW" "Waiting for K3s to become active..."
+    local active_timestamp=""
+    local max_wait=120  # Maximum 120 seconds
+    local elapsed=0
 
-    # Verify K3s is running
-    if systemctl is-active --quiet k3s; then
-        print_msg "$GREEN" "✓ K3s restarted successfully"
-    else
-        print_msg "$RED" "Error: K3s failed to start"
+    while [ -z "$active_timestamp" ] && (( $(echo "$elapsed < $max_wait" | bc -l) )); do
+        sleep $K3S_STATUS_CHECK_INTERVAL
+
+        if systemctl is-active --quiet k3s; then
+            # Capture the exact timestamp when K3s becomes active
+            active_timestamp=$(date +%s.%N)
+            local elapsed_time=$(echo "$active_timestamp - $start_time" | bc -l)
+            print_msg "$GREEN" "✓ K3s became active at: $active_timestamp ($(printf "%.3f" $elapsed_time)s after start command)"
+
+            # Save timestamp to file if provided
+            if [ -n "$timestamp_file" ]; then
+                echo "$active_timestamp" >> "$timestamp_file"
+            fi
+            break
+        fi
+
+        elapsed=$(echo "$elapsed + $K3S_STATUS_CHECK_INTERVAL" | bc -l)
+    done
+
+    if [ -z "$active_timestamp" ]; then
+        print_msg "$RED" "Error: K3s failed to become active within ${max_wait}s"
         return 1
     fi
+
+    # Additional wait for K3s API to be fully ready
+    print_msg "$YELLOW" "Waiting for K3s API to be fully ready..."
+    sleep 30
 }
 
 # Run a single experiment configuration
@@ -164,11 +194,18 @@ run_experiment() {
     local result_dir="${RESULTS_DIR}/${config_name}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$result_dir"
 
+    # Create K3s activation timestamps file
+    local k3s_timestamps_file="$result_dir/k3s_activation_timestamps.txt"
+    echo "# K3s activation timestamps (Unix epoch with nanoseconds)" > "$k3s_timestamps_file"
+    echo "# Format: Each line is the timestamp when K3s became active for that experiment" >> "$k3s_timestamps_file"
+    echo "# exp0 is warmup (not logged), exp1-exp20 timestamps are below" >> "$k3s_timestamps_file"
+
     # Save configuration info
     echo "Configuration: $config_name" > "$result_dir/config.txt"
     echo "Deployment: $deployment_file" >> "$result_dir/config.txt"
     echo "Pod Count: $expected_pod_count" >> "$result_dir/config.txt"
-    echo "Max Experiments: $MAX_EXPERIMENTS" >> "$result_dir/config.txt"
+    echo "Max Experiments (including warmup): $MAX_EXPERIMENTS" >> "$result_dir/config.txt"
+    echo "Logged Experiments: $((MAX_EXPERIMENTS - 1))" >> "$result_dir/config.txt"
     echo "Start Time: $(date)" >> "$result_dir/config.txt"
 
     # Clean up data directory
@@ -184,16 +221,24 @@ run_experiment() {
     # Wait for initial pods to be ready
     wait_for_pods_ready "timing-experiment" "$expected_pod_count" 120
 
-    # Run experiment iterations
+    # Run experiment iterations (exp0 to exp20, where exp0 is warmup)
     for exp_num in $(seq 0 $((MAX_EXPERIMENTS - 1))); do
-        print_header "Experiment $config_name - Iteration $((exp_num + 1))/$MAX_EXPERIMENTS"
+        if [ $exp_num -eq 0 ]; then
+            print_header "Experiment $config_name - Warmup (exp0 - not logged)"
+        else
+            print_header "Experiment $config_name - Iteration $exp_num/$((MAX_EXPERIMENTS - 1))"
+        fi
 
         # Wait for logs to be written
         print_msg "$YELLOW" "Waiting ${LOG_COLLECTION_WAIT}s for logs to be written..."
         sleep $LOG_COLLECTION_WAIT
 
-        # Collect logs
-        collect_logs "$data_dir" "$result_dir" "$exp_num"
+        # Collect logs only if not warmup (exp0)
+        if [ $exp_num -gt 0 ]; then
+            collect_logs "$data_dir" "$result_dir" "$exp_num"
+        else
+            print_msg "$YELLOW" "Skipping log collection for warmup iteration"
+        fi
 
         # Clear the data directory for next iteration
         print_msg "$YELLOW" "Clearing data directory for next iteration..."
@@ -201,7 +246,7 @@ run_experiment() {
 
         # If not the last experiment, restart K3s
         if [ $exp_num -lt $((MAX_EXPERIMENTS - 1)) ]; then
-            restart_k3s
+            restart_k3s "$k3s_timestamps_file"
 
             # Wait for pods to be ready again (K3s will automatically restart existing deployments)
             wait_for_pods_ready "timing-experiment" "$expected_pod_count" 120
@@ -217,15 +262,36 @@ run_experiment() {
 
     # Generate summary
     print_msg "$YELLOW" "Generating summary..."
-    local total_files=$(find "$result_dir" -name "*.txt" -not -name "config.txt" | wc -l)
+    local total_files=$(find "$result_dir" -name "*.txt" -not -name "config.txt" -not -name "k3s_activation_timestamps.txt" | wc -l)
+    local k3s_timestamp_count=$(grep -v "^#" "$k3s_timestamps_file" | wc -l)
     echo "Total log files collected: $total_files" >> "$result_dir/config.txt"
+    echo "K3s activation timestamps recorded: $k3s_timestamp_count" >> "$result_dir/config.txt"
 
     print_msg "$GREEN" "✓ Experiment $config_name completed!"
     print_msg "$GREEN" "Results saved to: $result_dir"
+    print_msg "$GREEN" "K3s activation timestamps: $k3s_timestamps_file"
 }
 
 # Main execution
 main() {
+    # Parse command line arguments
+    local build_images_flag=false
+
+    for arg in "$@"; do
+        case $arg in
+            --build)
+                build_images_flag=true
+                shift
+                ;;
+            *)
+                print_msg "$RED" "Unknown option: $arg"
+                print_msg "$YELLOW" "Usage: $0 [--build]"
+                print_msg "$YELLOW" "  --build    Build and import Docker images before experiments"
+                exit 1
+                ;;
+        esac
+    done
+
     print_header "K3s Pod Timing Experiment Suite"
 
     # Check if running as root
@@ -243,7 +309,7 @@ main() {
     fi
 
     # Check required commands
-    for cmd in kubectl docker k3s; do
+    for cmd in kubectl docker k3s bc; do
         if ! command -v $cmd &> /dev/null; then
             print_msg "$RED" "Error: Required command '$cmd' not found"
             exit 1
@@ -259,9 +325,13 @@ main() {
     # Create results directory
     mkdir -p "$RESULTS_DIR"
 
-    # Build and import images
-    # build_images
-    # import_images_to_k3s
+    # Conditionally build and import images
+    if [ "$build_images_flag" = true ]; then
+        build_images
+        import_images_to_k3s
+    else
+        print_msg "$YELLOW" "Skipping image build (use --build flag to build images)"
+    fi
 
     print_header "Experiment Configurations"
     print_msg "$YELLOW" "1. Ubuntu 22.04 - 8 pods"
@@ -269,7 +339,8 @@ main() {
     print_msg "$YELLOW" "3. ROS2 Humble - 8 pods"
     print_msg "$YELLOW" "4. ROS2 Humble - 16 pods"
     print_msg "$YELLOW" "All configurations use core-id annotation: 8-15"
-    print_msg "$YELLOW" "Each configuration will run for $MAX_EXPERIMENTS iterations"
+    print_msg "$YELLOW" "Each configuration will run for $((MAX_EXPERIMENTS - 1)) iterations (exp1-exp$((MAX_EXPERIMENTS - 1)))"
+    print_msg "$YELLOW" "Note: exp0 is a warmup iteration and will not be logged"
     echo ""
 
     read -p "Do you want to run all experiments? (y/n) " -n 1 -r

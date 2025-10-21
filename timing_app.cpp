@@ -15,9 +15,9 @@ std::string getPodName() {
     return std::string(hostname);
 }
 
-// Get monotonic clock time
+// Get realtime clock time (Unix epoch)
 void getCurrentTime(struct timespec* ts) {
-    clock_gettime(CLOCK_MONOTONIC, ts);
+    clock_gettime(CLOCK_REALTIME, ts);
 }
 
 // Format timespec to string
@@ -38,7 +38,7 @@ int main() {
     struct timespec startTime;
     getCurrentTime(&startTime);
 
-    std::cout << "Start time (CLOCK_MONOTONIC): "
+    std::cout << "Start time (CLOCK_REALTIME): "
               << formatTime(startTime) << std::endl;
 
     // Write timing data to shared folder
